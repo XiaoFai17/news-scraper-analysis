@@ -1,143 +1,173 @@
-import requests
-from bs4 import BeautifulSoup
-import feedparser
+from gnews import GNews
+from newspaper import Article
 from datetime import datetime
 import time
 import re
-from urllib.parse import unquote
+from bs4 import BeautifulSoup
 
-# newspaper3k untuk extract artikel dari URL
-from newspaper import Article
-
-
-# ============================================================
-# USER AGENTS
-# ============================================================
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-]
-
-
-def get_headers(index: int = 0) -> dict:
-    return {
-        "User-Agent": USER_AGENTS[index % len(USER_AGENTS)],
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
-    }
+# Selenium untuk resolve Google News URL
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 
 # ============================================================
-# BAGIAN 1: Resolve Google News URL -> URL Asli
+# Global Selenium Driver (reuse untuk efficiency)
 # ============================================================
 
-def resolve_google_news_url(google_url: str) -> str:
+_driver = None
+
+
+def get_selenium_driver():
     """
-    Resolve Google News redirect URL ke URL artikel asli.
-    Fetch HTML dari Google News dan extract link yang bukan google.com.
+    Get or create Selenium WebDriver instance.
+    Driver di-reuse untuk semua requests agar lebih efisien.
     """
-    if not google_url:
-        return ""
+    global _driver
+    
+    if _driver is None:
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')  # Tanpa GUI
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36')
+        
+        # Disable images untuk speed
+        prefs = {'profile.managed_default_content_settings.images': 2}
+        chrome_options.add_experimental_option('prefs', prefs)
+        
+        _driver = webdriver.Chrome(options=chrome_options)
+    
+    return _driver
 
+
+def close_selenium_driver():
+    """Close Selenium driver saat selesai."""
+    global _driver
+    if _driver is not None:
+        _driver.quit()
+        _driver = None
+
+
+# ============================================================
+# BAGIAN 1: Fetch dari Google News menggunakan GNews
+# ============================================================
+
+def fetch_rss(keyword: str, max_results: int = 100) -> dict:
+    """Fetch berita dari Google News menggunakan GNews."""
     try:
-        response = requests.get(google_url, headers=get_headers(), allow_redirects=True, timeout=15)
+        google_news = GNews(
+            language='id',
+            country='ID',
+            max_results=max_results
+        )
+        
+        news_results = google_news.get_news(keyword)
+        articles = []
+        
+        for item in news_results:
+            date_str = item.get('published date', '')
+            try:
+                tanggal = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %Z')
+            except:
+                tanggal = None
+            
+            judul = item.get('title', '').strip()
+            
+            publisher_info = item.get('publisher', {})
+            if isinstance(publisher_info, dict):
+                nama_media = publisher_info.get('title', 'Unknown')
+            else:
+                nama_media = str(publisher_info) if publisher_info else 'Unknown'
+            
+            articles.append({
+                'title': judul,
+                'date': tanggal,
+                'url': item.get('url', ''),
+                'source': nama_media,
+                'content': '',
+                'journalist': ''
+            })
+        
+        return {'error': None, 'articles': articles}
+    
+    except Exception as e:
+        return {'error': f'Gagal fetch: {str(e)}', 'articles': []}
 
-        # Kalau sudah redirect ke non-google, langsung return
-        if "google.com" not in response.url and "news.google.com" not in response.url:
-            return response.url
 
-        # Parse HTML dan cari link asli
-        soup = BeautifulSoup(response.text, "html.parser")
+# ============================================================
+# BAGIAN 2: Resolve Google News URL dengan Selenium
+# ============================================================
 
-        # Strategi 1: Cari <a> tag dengan href non-google
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
-            if href.startswith("http") and "google.com" not in href:
-                return href
-
-        # Strategi 2: Cari URL di dalam script tags
-        for script in soup.find_all("script"):
-            if script.string:
-                urls_found = re.findall(r'https?://[^"\s<>]+', script.string)
-                for url in urls_found:
-                    if "google.com" not in url and len(url) > 30:
-                        return unquote(url)
-
-        # Strategi 3: og:url meta tag
-        og_url = soup.find("meta", attrs={"property": "og:url"})
-        if og_url and og_url.get("content") and "google.com" not in og_url["content"]:
-            return og_url["content"]
-
-        # Semua gagal, return URL google
+def resolve_google_news_url_selenium(google_url: str, timeout: int = 10) -> str:
+    """
+    Resolve Google News URL menggunakan Selenium.
+    
+    Strategi:
+    1. Load halaman Google News dengan Selenium (render JavaScript)
+    2. Tunggu redirect otomatis atau cari link di halaman
+    3. Return URL final
+    """
+    if not google_url or 'news.google.com' not in google_url:
         return google_url
-
+    
+    try:
+        driver = get_selenium_driver()
+        
+        # Load halaman
+        driver.get(google_url)
+        
+        # Tunggu sebentar untuk redirect otomatis
+        time.sleep(2)
+        
+        # Cek URL setelah redirect
+        current_url = driver.current_url
+        
+        # Kalau sudah redirect ke artikel asli
+        google_domains = ['google.com', 'gstatic.com', 'googleusercontent.com']
+        if not any(domain in current_url for domain in google_domains):
+            return current_url
+        
+        # Kalau masih di Google, cari link di halaman
+        try:
+            # Tunggu ada link yang bukan Google
+            WebDriverWait(driver, timeout).until(
+                lambda d: any(
+                    elem.get_attribute('href') and 
+                    elem.get_attribute('href').startswith('http') and
+                    not any(gd in elem.get_attribute('href') for gd in google_domains)
+                    for elem in d.find_elements(By.TAG_NAME, 'a')
+                )
+            )
+            
+            # Ambil semua link
+            links = driver.find_elements(By.TAG_NAME, 'a')
+            candidate_urls = []
+            
+            for link in links:
+                href = link.get_attribute('href')
+                if href and href.startswith('http'):
+                    if not any(d in href for d in google_domains + ['youtube.com']):
+                        if len(href) > 30:
+                            candidate_urls.append(href)
+            
+            if candidate_urls:
+                # Ambil URL terpanjang
+                return max(candidate_urls, key=len)
+        
+        except Exception:
+            pass
+        
+        # Gagal, return URL asli
+        return google_url
+    
     except Exception:
         return google_url
-
-
-# ============================================================
-# BAGIAN 2: Fetch dari Google News RSS
-# ============================================================
-
-def build_rss_url(keyword: str, region: str = "ID:id") -> str:
-    keyword_encoded = keyword.replace(" ", "+")
-    return f"https://news.google.com/rss/search?q={keyword_encoded}&hl={region}"
-
-
-def fetch_rss(keyword: str) -> dict:
-    """
-    Fetch Google News RSS dan parse hasilnya.
-    Return: dict berisi 'error' dan 'articles'
-    """
-    rss_url = build_rss_url(keyword)
-
-    try:
-        feed = feedparser.parse(rss_url)
-    except Exception as e:
-        return {"error": f"Gagal fetch RSS: {str(e)}", "articles": []}
-
-    articles = []
-
-    for entry in feed.entries:
-
-        # --- Tanggal: pakai published_parsed (struct_time) dari feedparser ---
-        struct_time = entry.get("published_parsed", None)
-        tanggal = datetime(*struct_time[:6]) if struct_time else None
-
-        # --- Judul dan Nama Media ---
-        judul_raw = entry.get("title", "").strip()
-        nama_media = ""
-        judul = judul_raw
-
-        # Format: "Judul Berita - Nama Media"
-        if " - " in judul_raw:
-            bagian = judul_raw.rsplit(" - ", 1)
-            judul = bagian[0].strip()
-            nama_media = bagian[1].strip()
-
-        # Backup dari summary HTML: <font color="#6f6f6f">Nama Media</font>
-        if not nama_media:
-            summary_html = entry.get("summary", "")
-            soup_summary = BeautifulSoup(summary_html, "html.parser")
-            font_tag = soup_summary.find("font", attrs={"color": "#6f6f6f"})
-            if font_tag:
-                nama_media = font_tag.get_text(strip=True)
-
-        if not nama_media:
-            nama_media = "Unknown"
-
-        articles.append({
-            "title": judul,
-            "date": tanggal,
-            "url": entry.get("link", ""),   # masih Google News URL
-            "source": nama_media,
-            "content": "",
-            "journalist": ""
-        })
-
-    return {"error": None, "articles": articles}
 
 
 # ============================================================
@@ -145,28 +175,28 @@ def fetch_rss(keyword: str) -> dict:
 # ============================================================
 
 def filter_by_date(articles: list[dict], from_date: datetime, to_date: datetime) -> list[dict]:
-    """Filter artikel berdasarkan rentang tanggal (naive datetime)."""
+    """Filter artikel berdasarkan rentang tanggal."""
     filtered = []
-
-    if hasattr(from_date, "hour"):
+    
+    if hasattr(from_date, 'hour'):
         fd = from_date.replace(tzinfo=None, hour=0, minute=0, second=0)
     else:
         fd = datetime.combine(from_date, datetime.min.time())
-
-    if hasattr(to_date, "hour"):
+    
+    if hasattr(to_date, 'hour'):
         td = to_date.replace(tzinfo=None, hour=23, minute=59, second=59)
     else:
         td = datetime.combine(to_date, datetime.max.time())
-
+    
     for article in articles:
-        tanggal = article.get("date")
+        tanggal = article.get('date')
         if tanggal is None:
             continue
-        if hasattr(tanggal, "tzinfo") and tanggal.tzinfo is not None:
+        if hasattr(tanggal, 'tzinfo') and tanggal.tzinfo is not None:
             tanggal = tanggal.replace(tzinfo=None)
         if fd <= tanggal <= td:
             filtered.append(article)
-
+    
     return filtered
 
 
@@ -175,133 +205,137 @@ def filter_by_date(articles: list[dict], from_date: datetime, to_date: datetime)
 # ============================================================
 
 def scrape_with_newspaper(url: str) -> dict:
-    """
-    Extract artikel pakai newspaper3k.
-    newspaper3k dirancang khusus untuk extract main content dari halaman berita.
-    """
-    result = {"content": "", "journalist": ""}
-
+    """Scrape artikel pakai newspaper3k."""
+    result = {'content': '', 'journalist': ''}
+    
     try:
-        article = Article(url, language="id")
+        article = Article(url, language='id')
         article.download()
         article.parse()
-
+        
         if article.text and len(article.text.strip()) > 50:
-            result["content"] = article.text.strip()
-
+            result['content'] = article.text.strip()
+        
         if article.authors:
-            result["journalist"] = ", ".join(article.authors)
-
+            result['journalist'] = ', '.join(article.authors)
+    
     except Exception as e:
-        result["content"] = f"[newspaper3k: {str(e)}]"
-
+        result['content'] = f'[newspaper3k: {str(e)}]'
+    
     return result
 
 
-def scrape_with_beautifulsoup(url: str) -> dict:
-    """Fallback scraping pakai BeautifulSoup."""
-    result = {"content": "", "journalist": ""}
-
+def scrape_with_selenium_direct(url: str) -> dict:
+    """Scrape menggunakan Selenium + BeautifulSoup."""
+    result = {'content': '', 'journalist': ''}
+    
     try:
-        response = requests.get(url, headers=get_headers(), timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        for tag in soup(["script", "style", "nav", "header", "footer",
-                         "aside", "iframe", "noscript", "svg", "button"]):
+        driver = get_selenium_driver()
+        driver.get(url)
+        
+        # Tunggu halaman load
+        time.sleep(3)
+        
+        # Parse HTML dari Selenium
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        
+        # Hapus noise
+        for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
             tag.decompose()
-
-        content = ""
-
-        # <article> tag
-        article_tag = soup.find("article")
+        
+        content = ''
+        
+        # Cari <article>
+        article_tag = soup.find('article')
         if article_tag:
-            content = article_tag.get_text(separator=" ", strip=True)
-
-        # Class umum
+            content = article_tag.get_text(separator=' ', strip=True)
+        
+        # Fallback
         if len(content) < 100:
-            for cls in ["article-content", "article-body", "post-content",
-                        "entry-content", "content-article", "article__body",
-                        "DetailArticle_content", "article_content",
-                        "text-article", "body-article", "konten-artikel"]:
+            for cls in ['article-content', 'article-body', 'post-content']:
                 elem = soup.find(class_=cls)
                 if elem:
-                    content = elem.get_text(separator=" ", strip=True)
+                    content = elem.get_text(separator=' ', strip=True)
                     if len(content) > 100:
                         break
-
-        # Kumpul <p> panjang
+        
         if len(content) < 100:
-            texts = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) > 50]
-            content = " ".join(texts)
-
-        content = re.sub(r"\s+", " ", content).strip()
-        result["content"] = content if content else ""
-
-        # Meta author
-        meta_author = soup.find("meta", attrs={"name": re.compile(r"author", re.I)})
-        if meta_author and meta_author.get("content"):
-            journalist = meta_author["content"].strip()
-            if len(journalist) < 60:
-                result["journalist"] = journalist
-
+            texts = [p.get_text(strip=True) for p in soup.find_all('p') if len(p.get_text(strip=True)) > 50]
+            content = ' '.join(texts)
+        
+        content = re.sub(r'\s+', ' ', content).strip()
+        result['content'] = content if content else ''
+        
+        # Author
+        meta_author = soup.find('meta', attrs={'name': re.compile(r'author', re.I)})
+        if meta_author and meta_author.get('content'):
+            result['journalist'] = meta_author['content'].strip()
+    
     except Exception:
         pass
-
+    
     return result
 
 
 def scrape_full_text(google_news_url: str) -> dict:
-    """
-    Main scrape per artikel:
-    1. Resolve Google News URL -> URL asli
-    2. Coba newspaper3k dulu
-    3. Kalau gagal / konten pendek, fallback ke BeautifulSoup
-    """
-    result = {"resolved_url": google_news_url, "content": "", "journalist": ""}
-
-    # Step 1: Resolve URL
-    real_url = resolve_google_news_url(google_news_url)
-    result["resolved_url"] = real_url
-
-    # Step 2: newspaper3k
+    """Main scraping function."""
+    result = {'resolved_url': google_news_url, 'content': '', 'journalist': ''}
+    
+    # Resolve URL pakai Selenium
+    real_url = resolve_google_news_url_selenium(google_news_url)
+    result['resolved_url'] = real_url
+    
+    # Kalau masih Google URL
+    if 'google.com' in real_url or 'gstatic.com' in real_url:
+        result['content'] = '[URL tidak berhasil di-resolve]'
+        return result
+    
+    # Coba newspaper3k dulu
     newspaper_result = scrape_with_newspaper(real_url)
-    if newspaper_result["content"] and len(newspaper_result["content"]) > 100:
-        result["content"] = newspaper_result["content"]
-        result["journalist"] = newspaper_result["journalist"]
+    if newspaper_result['content'] and len(newspaper_result['content']) > 100 and not newspaper_result['content'].startswith('['):
+        result['content'] = newspaper_result['content']
+        result['journalist'] = newspaper_result['journalist']
         return result
-
-    # Step 3: Fallback BeautifulSoup
-    bs_result = scrape_with_beautifulsoup(real_url)
-    if bs_result["content"] and len(bs_result["content"]) > 100:
-        result["content"] = bs_result["content"]
-        result["journalist"] = bs_result["journalist"] or newspaper_result["journalist"]
+    
+    # Fallback: Selenium scraping
+    selenium_result = scrape_with_selenium_direct(real_url)
+    if selenium_result['content'] and len(selenium_result['content']) > 100:
+        result['content'] = selenium_result['content']
+        result['journalist'] = selenium_result['journalist'] or newspaper_result['journalist']
         return result
-
-    # Kedua gagal
-    if newspaper_result["content"] and not newspaper_result["content"].startswith("["):
-        result["content"] = newspaper_result["content"]
-        result["journalist"] = newspaper_result["journalist"]
+    
+    # Semua gagal
+    if newspaper_result['content']:
+        result['content'] = newspaper_result['content']
+        result['journalist'] = newspaper_result['journalist']
     else:
-        result["content"] = "[Konten tidak berhasil di-extract]"
-
+        result['content'] = '[Konten tidak berhasil di-extract]'
+    
     return result
 
 
-def scrape_all_articles(articles: list[dict], delay: float = 1.5) -> list[dict]:
-    """Scrape semua artikel dengan delay antar request."""
+def scrape_all_articles(articles: list[dict], delay: float = 1.0) -> list[dict]:
+    """
+    Scrape semua artikel dengan delay.
+    Selenium driver akan di-reuse untuk semua artikel.
+    """
     scraped = []
-
-    for i, article in enumerate(articles):
-        result = scrape_full_text(article["url"])
-
-        article["content"] = result["content"]
-        article["journalist"] = result["journalist"]
-        article["url"] = result["resolved_url"]
-
-        scraped.append(article)
-
-        if i < len(articles) - 1:
-            time.sleep(delay)
-
+    
+    try:
+        for i, article in enumerate(articles):
+            result = scrape_full_text(article['url'])
+            
+            article['content'] = result['content']
+            article['journalist'] = result['journalist']
+            article['url'] = result['resolved_url']
+            
+            scraped.append(article)
+            
+            if i < len(articles) - 1:
+                time.sleep(delay)
+    
+    finally:
+        # Close driver setelah semua selesai
+        close_selenium_driver()
+    
     return scraped
