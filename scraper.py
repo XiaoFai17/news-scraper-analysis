@@ -3,6 +3,7 @@ from newspaper import Article
 from datetime import datetime
 import time
 import re
+import requests as req_lib
 from bs4 import BeautifulSoup
 
 # Selenium untuk resolve Google News URL
@@ -52,6 +53,45 @@ def close_selenium_driver():
     if _driver is not None:
         _driver.quit()
         _driver = None
+
+
+# ============================================================
+# Daftar Domain & Pattern untuk Validasi Konten
+# ============================================================
+
+SOCIAL_MEDIA_DOMAINS = [
+    'twitter.com', 'x.com', 'facebook.com', 'fb.com',
+    'instagram.com', 'tiktok.com',
+]
+
+GARBAGE_CONTENT_PATTERNS = [
+    'javascript is not available',
+    'javascript is disabled in this browser',
+    'please enable javascript',
+    'switch to a supported browser',
+    'continue using x.com',
+    'continue using twitter.com',
+    'cookies are disabled',
+    'access denied',
+    '403 forbidden',
+    'halaman tidak ditemukan',
+    'page not found',
+    '404 not found',
+]
+
+
+def is_social_media_url(url: str) -> bool:
+    """Cek apakah URL mengarah ke platform sosial media."""
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in SOCIAL_MEDIA_DOMAINS)
+
+
+def is_garbage_content(content: str) -> bool:
+    """Cek apakah content hasil scrape adalah garbage/bukan berita."""
+    if not content or len(content.strip()) < 50:
+        return True
+    content_lower = content.lower()
+    return any(pattern in content_lower for pattern in GARBAGE_CONTENT_PATTERNS)
 
 
 # ============================================================
@@ -122,8 +162,8 @@ def resolve_google_news_url_selenium(google_url: str, timeout: int = 10) -> str:
         # Load halaman
         driver.get(google_url)
         
-        # Tunggu sebentar untuk redirect otomatis
-        time.sleep(2)
+        # Tunggu lebih lama untuk redirect otomatis (Google News butuh waktu)
+        time.sleep(5)
         
         # Cek URL setelah redirect
         current_url = driver.current_url
@@ -168,6 +208,28 @@ def resolve_google_news_url_selenium(google_url: str, timeout: int = 10) -> str:
     
     except Exception:
         return google_url
+
+
+def resolve_with_requests(google_url: str):
+    """Coba resolve Google News URL dengan HTTP redirect (lebih cepat dari Selenium)."""
+    if not google_url or 'news.google.com' not in google_url:
+        return google_url
+    try:
+        resp = req_lib.get(
+            google_url,
+            allow_redirects=True,
+            timeout=15,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        )
+        final_url = resp.url
+        google_domains = ['google.com', 'gstatic.com', 'googleusercontent.com']
+        if not any(d in final_url for d in google_domains):
+            return final_url
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
@@ -281,31 +343,43 @@ def scrape_full_text(google_news_url: str) -> dict:
     """Main scraping function."""
     result = {'resolved_url': google_news_url, 'content': '', 'journalist': ''}
     
-    # Resolve URL pakai Selenium
-    real_url = resolve_google_news_url_selenium(google_news_url)
+    # Step 1: Resolve URL — coba requests dulu (cepat), fallback ke Selenium
+    real_url = resolve_with_requests(google_news_url)
+    if not real_url:
+        real_url = resolve_google_news_url_selenium(google_news_url)
     result['resolved_url'] = real_url
     
-    # Kalau masih Google URL
+    # Kalau masih Google URL → gagal resolve
     if 'google.com' in real_url or 'gstatic.com' in real_url:
         result['content'] = '[URL tidak berhasil di-resolve]'
         return result
     
+    # Skip social media URLs (Twitter/X, Facebook, dll.)
+    if is_social_media_url(real_url):
+        result['content'] = '[Konten dari media sosial - tidak di-scrape]'
+        return result
+    
     # Coba newspaper3k dulu
     newspaper_result = scrape_with_newspaper(real_url)
-    if newspaper_result['content'] and len(newspaper_result['content']) > 100 and not newspaper_result['content'].startswith('['):
+    if (newspaper_result['content'] and 
+        len(newspaper_result['content']) > 100 and 
+        not newspaper_result['content'].startswith('[') and
+        not is_garbage_content(newspaper_result['content'])):
         result['content'] = newspaper_result['content']
         result['journalist'] = newspaper_result['journalist']
         return result
     
     # Fallback: Selenium scraping
     selenium_result = scrape_with_selenium_direct(real_url)
-    if selenium_result['content'] and len(selenium_result['content']) > 100:
+    if (selenium_result['content'] and 
+        len(selenium_result['content']) > 100 and
+        not is_garbage_content(selenium_result['content'])):
         result['content'] = selenium_result['content']
         result['journalist'] = selenium_result['journalist'] or newspaper_result['journalist']
         return result
     
     # Semua gagal
-    if newspaper_result['content']:
+    if newspaper_result['content'] and not is_garbage_content(newspaper_result['content']):
         result['content'] = newspaper_result['content']
         result['journalist'] = newspaper_result['journalist']
     else:

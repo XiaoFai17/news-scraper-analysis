@@ -18,9 +18,35 @@ def get_groq_client():
         _client = Groq(api_key=api_key)
     return _client
 
+# Pattern konten tidak valid (halaman error, sosial media, dsb.)
+GARBAGE_CONTENT_PATTERNS = [
+    'javascript is not available',
+    'javascript is disabled',
+    'please enable javascript',
+    'switch to a supported browser',
+    'continue using x.com',
+    'continue using twitter.com',
+    'access denied',
+    '403 forbidden',
+    'halaman tidak ditemukan',
+    'page not found',
+    'cookies are disabled',
+]
+
+
+def _is_garbage_content(content: str) -> bool:
+    """Cek apakah content adalah garbage (error page, sosmed, dsb.)."""
+    content_lower = content.lower()
+    return any(p in content_lower for p in GARBAGE_CONTENT_PATTERNS)
+
+
 def process_single_article(content: str) -> dict:
     """Mengirim satu teks artikel ke Groq untuk Summarization, Sentiment, dan Topic."""
     if not content or len(content.strip()) < 100 or content.startswith("["):
+        return {"summary": "-", "sentiment": "Netral", "topic": "-"}
+    
+    # Cek garbage content (halaman error JavaScript, cookie notice, dll.)
+    if _is_garbage_content(content):
         return {"summary": "-", "sentiment": "Netral", "topic": "-"}
         
     try:
@@ -84,6 +110,9 @@ def process_nlp(articles: list[dict], streamlit_progress=None) -> list[dict]:
             content.startswith("[Error") or
             content.startswith("[newspaper3k") or
             content.startswith("[Konten tidak") or
+            content.startswith("[Konten dari") or
+            content.startswith("[URL tidak") or
+            _is_garbage_content(content) or
             len(content) < 100):
             
             article["summary"] = "-"
